@@ -14,6 +14,11 @@ It costs a lot of money to compile a paper book, so I will first publish the con
 1. 把以前写的很多材料，按照书的章节来重新整理；
   - [VictoriaMetrics存储引擎分析.pdf](https://github.com/ahfuzhang/victoria-metrics-1.72.0/blob/master/VictoriaMetrics%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E%E5%88%86%E6%9E%90.pdf)
   - 相关的源码阅读笔记：https://github.com/ahfuzhang/victoria-metrics-1.72.0
+  - [【VictoriaMetrics的vmbackupmanager】这个一年卖 2 万美元的功能，我做出来了](https://www.cnblogs.com/ahfuzhang/p/17989390)
+  - [介绍一个我开源的项目：一键部署 VictoriaMetrics 群集](https://www.cnblogs.com/ahfuzhang/p/17875269.html)
+  - [源码阅读：VictoriaMetrics中的golang代码优化方法](https://www.cnblogs.com/ahfuzhang/p/15918127.html)
+  - [【VictoriaMetrics源码阅读】vm中仿照RoaringBitmap的实现：uint64set](https://www.cnblogs.com/ahfuzhang/p/15900852.html)
+  - [golang源码阅读：VictoriaMetrics中协程优先级的处理方式](https://www.cnblogs.com/ahfuzhang/p/15847860.html)
 2. 阅读 VictoriaLogs 部分的源码，增加对 VictoriaLogs 的内容。
 
 ## Summary
