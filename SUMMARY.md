@@ -8,3 +8,4 @@
 - [5.vm-storage基础结构](chapters/5_vm-storage基础结构.md)
 - [6.vm-storage的数据处理流程](chapters/6_vm-storage的数据处理流程.md)
 - [7.VictoriaMetrics的其他相关知识](chapters/7_VictoriaMetrics的其他相关知识.md)
+- [8.VictoriaLogs基础知识](chapters/8_VictoriaLogs基础知识.md)
