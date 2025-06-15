@@ -119,6 +119,111 @@ const (
 
 ### filterStreamCache
 
+## 数据 block 的细节
+
+### block header
+一个 column 序列化时，会判断列属于什么数据类型。
+列的数据类型如下：
+
+```go
+// lib/logstorage/values_encoder.go
+// valueType is the type of values stored in every column block.
+type valueType byte
+
+const (
+	// valueTypeUnknown is used for determining whether the value type is unknown.
+	valueTypeUnknown = valueType(0)
+
+	// default encoding for column blocks. Strings are stored as is.
+	valueTypeString = valueType(1)
+
+	// column blocks with small number of unique values are encoded as dict.
+	valueTypeDict = valueType(2)
+
+	// uint values up to 2^8-1 are encoded into valueTypeUint8.
+	// Every value occupies a single byte.
+	valueTypeUint8 = valueType(3)
+
+	// uint values up to 2^16-1 are encoded into valueTypeUint16.
+	// Every value occupies 2 bytes.
+	valueTypeUint16 = valueType(4)
+
+	// uint values up to 2^31-1 are encoded into valueTypeUint32.
+	// Every value occupies 4 bytes.
+	valueTypeUint32 = valueType(5)
+
+	// uint values up to 2^64-1 are encoded into valueTypeUint64.
+	// Every value occupies 8 bytes.
+	valueTypeUint64 = valueType(6)
+
+	// int values in the range [-(2^63) ... 2^63-1] are encoded into valueTypeInt64.
+	valueTypeInt64 = valueType(10)
+
+	// floating-point values are encoded into valueTypeFloat64.
+	valueTypeFloat64 = valueType(7)
+
+	// column blocks with ipv4 addresses are encoded as 4-byte strings.
+	valueTypeIPv4 = valueType(8)
+
+	// column blocks with ISO8601 timestamps are encoded into valueTypeTimestampISO8601.
+	// These timestamps are commonly used by Logstash.
+	valueTypeTimestampISO8601 = valueType(9)
+)
+```
+
+** 从这里可以看出：VictoriaLogs 花费大量的算力在对数据进行编码，从而节省存储空间。**
+
+为了达到高压缩率，对数据的探测其实是比较耗资源的：
+
+```go
+// lib/logstorage/values_encoder.go
+func (ve *valuesEncoder) encode(values []string, dict *valuesDict) (valueType, uint64, uint64) {
+	ve.reset()
+
+	if len(values) == 0 {
+		return valueTypeString, 0, 0
+	}
+
+	var vt valueType
+	var minValue, maxValue uint64
+
+	// Try dict encoding at first, since it gives the highest speedup during querying.
+	// It also usually gives the best compression, since every value is encoded as a single byte.
+	ve.buf, ve.values, vt = tryDictEncoding(ve.buf[:0], ve.values[:0], values, dict)
+	if vt != valueTypeUnknown {
+		return vt, 0, 0
+	}
+	// todo: 值得使用 simd 来优化整数转换
+	ve.buf, ve.values, vt, minValue, maxValue = tryUintEncoding(ve.buf[:0], ve.values[:0], values)
+	if vt != valueTypeUnknown {
+		return vt, minValue, maxValue
+	}
+
+	ve.buf, ve.values, vt, minValue, maxValue = tryIntEncoding(ve.buf[:0], ve.values[:0], values)
+	if vt != valueTypeUnknown {
+		return vt, minValue, maxValue
+	}
+
+	ve.buf, ve.values, vt, minValue, maxValue = tryFloat64Encoding(ve.buf[:0], ve.values[:0], values)
+	if vt != valueTypeUnknown {
+		return vt, minValue, maxValue
+	}
+
+	ve.buf, ve.values, vt, minValue, maxValue = tryIPv4Encoding(ve.buf[:0], ve.values[:0], values)
+	if vt != valueTypeUnknown {
+		return vt, minValue, maxValue
+	}
+
+	ve.buf, ve.values, vt, minValue, maxValue = tryTimestampISO8601Encoding(ve.buf[:0], ve.values[:0], values)
+	if vt != valueTypeUnknown {
+		return vt, minValue, maxValue
+	}
+
+	// Fall back to default encoding, e.g. leave values as is.
+	ve.values = append(ve.values[:0], values...)
+	return valueTypeString, 0, 0
+}
+```
 
 ## 相关文章
 
