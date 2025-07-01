@@ -4,7 +4,9 @@
 两年过去了，VictoriaLogs 已经非常成熟，并且还推出了群集版本。
 这个产品一如既往了延续了高性能低成本的风格，深入研究源码后，也看到了很多精彩的设计。
 
-## 日志的结构
+## 8.1 核心概念
+
+### 8.1.1 日志的结构
 目前的日志都是半结构化的，通常如下:
 
 ```text
@@ -15,13 +17,146 @@ tag_name_3: tag_value_3
 message: very long text
 ```
 
+或以 JSON 格式表示：
+
+```json
+{
+  "timestamp": "2025-07-01T10:35:27.123Z",
+  "tags": {
+    "level": "INFO",
+    "service": "auth-service",
+    "region": "ap-southeast-1",
+    "instance": "node-7"
+  },
+  "message": "User login succeeded for user_id=9482, method=oauth2"
+}
+```
+
+
+
 日志由三部分构成：
-- 时间戳
-- 标签
-- 消息
+
+- 时间戳 (timestamps)
+- 标签 (tags)
+- 消息 (message)
 
 显而易见，在标签部分，tag name + tag value 的格式， 与 metrics 数据的格式是一致的。
 因此，如果用存储 metrics 数据的方式来存储标签部分，那么就可以利用 tsdb 的存储引擎来高效过滤日志。
+
+
+
+### 8.1.2 数据的组织方式
+
+* 以日志的时间戳来对日志数据分片
+  * 每天一个文件夹
+  * 数据的保存周期最少 1 天
+  * 超过数据保存天数的旧文件夹会自动删除
+    * 从而避免存储空间变满
+* 通过索引和数据两部分来存储日志
+  * 日志中的tag name 和 tag value 存储为索引
+    * 查询时可以通过过滤 tag 来缩小日志的搜索范围
+  * 完整的一行日志(时间戳，tags, message)会完整的存储到数据部分
+
+
+
+### 8.1.3 streamID 的概念
+
+变化不频繁的 tag 可以作为 stream 的区分字段。
+例如：`idc + 机器ip + 容器 + 服务 + 日志输出位置` 构成一个 stream
+从而，同一个输出位置的日志会被放在内部的一个 stream 中。
+
+注意：频繁变化的字段，一定不要放在 stream 中。例如 client ip, user id 等。
+
+所有的 stream tag 放在一个 buffer 中，然后使用 xxhash 库计算 128 bit 的 hash 值。此 hash 值就是 streamID。
+
+选择哪些 tag 作为日志的 stream，可以参考以下原则：
+
+* stream 的核心用途是把一部分日志行放在同一个块中存放
+  * 因此，stream tag 太少，会导致存储时的快太大，无法高效地过滤不需要的数据
+  * Stream tag 太多，会导致块太多，从而数据的压缩率不高，且搜索时需要关联很多的块，同样影响性能
+
+* Stream 同样会影响日志的写入逻辑：
+  * 假如 tag1 + tag2 + tag3 的日志中，我们把 tag1 + tag2 作为 stream，第一次产生这样的日志时，tag1/tag2/tag3 都会建立索引。
+  * 如果后续日志中又出现了新的 tag，例如：tag1 + tag2 + tag3 + tag4这样的组合，因为 tag1 + tag2 不变，就会认为这条日志是已经存在的 stream，因此 tag4 不会被写入索引中。未来如果通过 tag4 过滤，是无法通过索引来加速的，只能到数据部分进行过滤。
+  * 因此，tag 的数量如果在日志输出的过程中动态增减，需要考虑到对索引的印象。
+
+* 不要把频繁变化的 tag value 放到 stream 中：
+  * 例如：user id, client ip 等（除非大多数情况下都要根据这个字段来过滤）
+  * 如同 VictoriaMetrics，过多的 time series 会导致创建大量索引。过多的不同 tag 的组合也会导致创建大量索引。
+
+
+
+### 8.1.4 使用 sstable 来存储索引
+
+VictoriaLogs 的索引，完全复用了 VictoriaMetrics 的索引的代码，他们都是通过 sstable 来组织起来索引数据：
+
+* sstable(Sorted String Table) 可以理解为非常非常多排好序的字符串
+* key-value结构会序列化成字符串，然后放到 sstable 中
+* 通过二分查找 + 前缀匹配，即可搜索到需要的 key-value
+
+
+
+### 8.1.5 使用 block 来存储日志数据
+
+同一个 streamID 的日志，会存储在一个 block 中。block 中包含了多行日志的 timestamp, tags 和 message。
+
+有这样一些机制来对block中的日志进行压缩：
+
+* 所有的 timestamp 单独存放
+  * 如果所有的timestamp都相同，则只存储一个值
+  * timestamp会进行排序，从小到大，然后后一项与前一项相减，得到 delta 值，然后存储第一个 timestamp 和 delta 值
+    * 一个完整的 timestamp 需要一个 int64 来保存，但是如果一个 block 中的日志差不多都是在邻近的时间段产生的，这样相减后的 delta 值就比较小，可能用更少的 bits 就能存储下来，节省存储空间
+* 日志中的 message 部分，被看做 tag name 为 _msg 的 tag，其处理行为与 tag 一致
+* 如果一个 tag 的所有 tag value 都一样，则这个 tag 被成为 const column，存储时只存储一个 tag name 和 tag value
+* 每个 tag name 会转换为 column，每个 tag name 只存储一次
+* 所有的 tag value 会做很多种格式判断：
+  * 如果所有的 tag value都只有很少的几种组合，则按照字典格式存储：在 block header 中存储字典的值，然后 tag value中存储字典中的下标
+  * 如果所有的 tag value 都是 uint64 / int64 / float64，则转换为数值类型来存储
+  * 如果所有的 tag value 都是 ipv4，则转换成数值类型来存储
+  * 如果是无规律的字符串，则按照字符串来存储
+
+* 每个 column 内的 tag value，会进行分词处理
+
+  * 对于 ASCII 字符集，连续的 0-9, a-z, A-Z 和 _ 被认为是一个 token
+  * 对于 unicode 字符集，会先把 utf-8 解码为逐个 rune 字符，然后判断是否是 token
+    * 注意：<font color=red>连续的unicode串会被认为是一个token，所以如果日志中有中文，整个中文长句子会被认为是一个词</font> 
+
+  * 分词得到 token 后，通过 xxhash 计算得到一个 hash 值，然后把 hash 值保存到 bloom filter 数据结构中
+  * 存储到磁盘时，会写一个独立的 bloom filter 的文件
+
+* 所有的数据写入磁盘时，会使用 ZSTD 压缩算法进行压缩
+
+### 8.1.6 数据的层级结构
+
+索引数据通过如下的层级组织起来：
+
+* partition: 每天一个分区文件夹
+
+* Indexdb: 仅一个文件夹，内部是索引相关的数据文件
+
+* Part:  用一个独立文件夹存储多个索引文件
+
+* Block:  每个数据文件中包含多个 block
+
+* IndexItem: 具体的一条索引，由索引类型 + tenantID + key + value 构成
+
+* inMemoryPart: 内存中的 part 数据，积累到一定的量后，存储到磁盘，成为独立的 part 文件夹
+
+* Rows 数组：索引创建时被追加到一个大数组，积累到一定的量后，变成 inMemoryPart
+
+  
+
+日志数据通过如下的层级组织起来：
+
+* Partition: 每天一个分区文件夹
+* datadb: 仅一个文件夹，内部是日志数据相关的文件
+* Part: 用一个独立的文件夹存储多个数据文件
+* Block: 一个 part 中的数据文件，包含多个 block；每个 block 存储一个 streamID 的多条日志
+* LogItem: block 中一条日志的内容，包含 timestamp 和 tags (message 是一个叫做 _msg 的 tag)
+
+
+
+
 
 对一些基本概念总结如下：
 ![](../assets/img/8/VictoriaLogs.png)
@@ -31,10 +166,11 @@ message: very long text
 * message 字段的 tag name 是 _msg
   - 写入索引时，message 对应的 tag name 是空字符串
 * tenantID 概念：用户可以使用两个 uint32 来表示一个 tenantID
-  - 区分 tenantID 后，每次查询比如提供正确的 tenantID
+  - 区分 tenantID 后，每次查询必须提供正确的 tenantID
+  - 在索引部分，tenantID 是所有数据的前缀。因此猜不到别的业务的 tenantID 就会查询不出数据，从而实现了租户的数据隔离。
 
 
-## 数据的目录结构
+## 8.2 数据的目录结构
 VictoriaLogs 存储数据的目录结构如下：
 
 - partitions
@@ -63,16 +199,9 @@ VictoriaLogs 存储数据的目录结构如下：
 * 每天会建立一个新的文件夹，文件夹中包含索引和数据
 * 进程启动时还会创建锁文件：flock.lock
 
-## streamID 的概念
-变化不频繁的 tag 可以作为 stream 的区分字段。
-例如：idc + 机器ip + 容器 构成一个 stream
-从而，同一个容器的日志会被放在内部的一个 stream 中。
 
-注意：频繁变化的字段，一定不要放在 stream 中。例如 client ip, user id 等。
 
-所有的 stream tag 放在一个 buffer 中，然后使用 xxhash 库计算 128 bit 的 hash 值。此 hash 值就是 streamID
-
-## 索引的格式
+## 8.4 索引的格式
 日志中的所有 tag 都会建立索引
 
 ```go
@@ -110,18 +239,33 @@ const (
 	}
 ```
 
-## cache 结构
+## 8.5 cache 结构
 
-### streamID cache
+* cache 有两个分片：prev 和 curr
+* 每隔 3 分钟左右：prev 会被丢弃，curr 变成 prev，然后一个新的 sync.Map 对象作为 curr
+  * 因此，cache 只能存储最多 6 分钟左右的数据
+  * 为什么缓存切换不是精确的 3 分钟？猜测这里是为了避免在分布式环境中，所有的存储节点的缓存一起失效引起抖动。
+  * 为何 cache 的时间如此之短？以 filterStreamCache 为例，每次查询时，通过查询表达式来得到上次搜索所有相关的 streamID。相当于 6 分钟之内，新产生的 streamID 是搜索不到的。
+    * 不缓存，频繁的查询就会每次都搜索索引
+    * 缓存了，缓存周期内的产生的数据查询不到
+    * 最终，6 分钟左右的时间可能在查询性能和新 streamID 可搜索到这两个事情上，可以取一个平衡
+
+### 8.5.1 streamID cache
 
 * key: 分区名 + streamID
 * value: bool 值，表示存在此 streamID
 
-### filterStreamCache
+### 8.5.2 filterStreamCache
 
-## 数据 block 的细节
+相当于把查询表达式为 key，对应着与这个 key 相关的所有 streamID
 
-### block header
+> logsSQL expr -> streamID list
+
+
+
+## 8.6 数据 block 的细节
+
+### 8.6.1 block header
 一个 column 序列化时，会判断列属于什么数据类型。
 列的数据类型如下：
 
@@ -171,7 +315,11 @@ const (
 )
 ```
 
-** 从这里可以看出：VictoriaLogs 花费大量的算力在对数据进行编码，从而节省存储空间。**
+
+
+**从这里可以看出：VictoriaLogs 花费大量的算力在对数据进行编码，从而节省存储空间。**
+
+
 
 为了达到高压缩率，对数据的探测其实是比较耗资源的：
 
@@ -225,6 +373,20 @@ func (ve *valuesEncoder) encode(values []string, dict *valuesDict) (valueType, u
 }
 ```
 
+
+
+## todo
+
+* 数据的写入流程
+* 数据的查询流程
+* 数据的 merge 流程
+* 并发管理
+* 群集版
+
+
+
 ## 相关文章
+
+
 
 * [VictoriaLogs Source Reading](https://medium.com/@waynest/victorialogs-source-reading-833db3e8511b)
