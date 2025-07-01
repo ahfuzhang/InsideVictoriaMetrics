@@ -201,7 +201,7 @@ VictoriaLogs 存储数据的目录结构如下：
 
 
 
-## 8.4 索引的格式
+## 8.3 索引的格式
 日志中的所有 tag 都会建立索引
 
 ```go
@@ -239,33 +239,11 @@ const (
 	}
 ```
 
-## 8.5 cache 结构
-
-* cache 有两个分片：prev 和 curr
-* 每隔 3 分钟左右：prev 会被丢弃，curr 变成 prev，然后一个新的 sync.Map 对象作为 curr
-  * 因此，cache 只能存储最多 6 分钟左右的数据
-  * 为什么缓存切换不是精确的 3 分钟？猜测这里是为了避免在分布式环境中，所有的存储节点的缓存一起失效引起抖动。
-  * 为何 cache 的时间如此之短？以 filterStreamCache 为例，每次查询时，通过查询表达式来得到上次搜索所有相关的 streamID。相当于 6 分钟之内，新产生的 streamID 是搜索不到的。
-    * 不缓存，频繁的查询就会每次都搜索索引
-    * 缓存了，缓存周期内的产生的数据查询不到
-    * 最终，6 分钟左右的时间可能在查询性能和新 streamID 可搜索到这两个事情上，可以取一个平衡
-
-### 8.5.1 streamID cache
-
-* key: 分区名 + streamID
-* value: bool 值，表示存在此 streamID
-
-### 8.5.2 filterStreamCache
-
-相当于把查询表达式为 key，对应着与这个 key 相关的所有 streamID
-
-> logsSQL expr -> streamID list
 
 
+## 8.4 数据的格式
 
-## 8.6 数据 block 的细节
-
-### 8.6.1 block header
+### 8.4.1 block header
 一个 column 序列化时，会判断列属于什么数据类型。
 列的数据类型如下：
 
@@ -375,10 +353,92 @@ func (ve *valuesEncoder) encode(values []string, dict *valuesDict) (valueType, u
 
 
 
+## 8.5 cache 结构
+
+* cache 有两个分片：prev 和 curr
+* 每隔 3 分钟左右：prev 会被丢弃，curr 变成 prev，然后一个新的 sync.Map 对象作为 curr
+  * 因此，cache 只能存储最多 6 分钟左右的数据
+  * 为什么缓存切换不是精确的 3 分钟？猜测这里是为了避免在分布式环境中，所有的存储节点的缓存一起失效引起抖动。
+  * 为何 cache 的时间如此之短？以 filterStreamCache 为例，每次查询时，通过查询表达式来得到上次搜索所有相关的 streamID。相当于 6 分钟之内，新产生的 streamID 是搜索不到的。
+    * 不缓存，频繁的查询就会每次都搜索索引
+    * 缓存了，缓存周期内的产生的数据查询不到
+    * 最终，6 分钟左右的时间可能在查询性能和新 streamID 可搜索到这两个事情上，可以取一个平衡
+
+### 8.5.1 streamID cache
+
+* key: 分区名 + streamID
+* value: bool 值，表示存在此 streamID
+
+### 8.5.2 filterStreamCache
+
+相当于把查询表达式为 key，对应着与这个 key 相关的所有 streamID
+
+> logsSQL expr -> streamID list
+
+
+
+## 8.6 日志数据写入流程
+
+* Vlinsert 服务
+* Vlstorage 服务
+* internal/insert 接口
+* 各种日志数据的解析模块：jsonline 等
+* 写入 Rows
+* Rows 变成 inMemoryPart
+* inMemoryPart 积累多个后，把数据 flush 到磁盘
+* 计算每条日志的 streamID
+* 从 cache 搜索 streamID 是否已经存在
+  * 不存在，创建新的 streamID
+    * 创建索引 0：streamID -> 空，表示存在这样一个 streamID
+    * 创建索引 1:   streamID -> stream tags
+    * 创建索引 2: 为每个 tag 创建索引， tag name + tag value -> streamID
+  * 存在，跳过写索引的步骤
+* 写入数据
+  * 计算 const 列
+  * 每一列的 values，尝试解析数据类型，根据数据类型做转换
+  * 每一列的values 中的每个 value，做分词运算，然后把分词结果计算 hashcode，然后写入 bloom filter
+  * 数据做 zstd 压缩，写入文件
+
+
+
+## 8.7 数据查询流程
+
+* vlselect 转发到 vlstorage
+* Vlstorage 中根据路径跳转到处理函数
+* 解析查询表达式，生成 Query 对象
+* 根据查询的时间范围，每天的数据创建一个协程，进行搜索
+  * 如果允许用 N 个 CPU 核，则全局只允许 N 个协程，在每天的 partition 上搜索
+* 每个查询，创建 N 个核对应的 N 个消费者协程，用于搜索到 block 后，对 block 的数据进行解析
+  * 如果只查一天内的数据，则只有 1 个搜索协程
+  * 每次查询都会有 N 个消费协程
+* 使用查询缓存： logsQL -> streamID list，缓存 6 分钟内的查询结果
+  * 缓存有数据：使用 streamID 的列表，在数据部分进行搜索
+  * 缓存无数据：
+    * 根据 tag name + tag value， 构造索引 2 的前缀
+    * 使用火山模型，依次逐层搜索符合条件的索引
+      * 先在一天内的所有 part header 上做二分查找
+      * 在每个 part 的所有 block header 上做二分查找
+      * Block 不在内存中，就把 block 载入内存，形成 sstable
+      * 在 sstable 上做二分查找
+    * 最终在索引上得到所有符合条件的 streamID
+
+* 得到 streamID list 后，在数据上搜索
+  * 使用火山模型，逐层搜索符合条件的 block
+    * 先搜索一天内的所有 part header
+    * 在 part 内搜索 block header
+  * 每个 block 与 streamID 是对应的
+  * 把 block 的信息写入 channel，等待消费者协程来处理
+* 消费者协程：
+  * 得到 block 的信息后，把 block 载入内存
+  * 执行各种 filter
+* 数据回传
+  * 把数据写入 writeBlock 的回调函数
+  * 函数中对数据做序列化，发送给请求端
+
+
+
 ## todo
 
-* 数据的写入流程
-* 数据的查询流程
 * 数据的 merge 流程
 * 并发管理
 * 群集版
