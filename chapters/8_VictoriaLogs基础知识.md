@@ -437,6 +437,44 @@ func (ve *valuesEncoder) encode(values []string, dict *valuesDict) (valueType, u
 
 
 
+## 8.8 群集版
+
+群集版没有区分不同角色的进程，仍然只是一个独立的 victoria-logs 进程。
+
+这个进程里同时启动了 vlselect, vlinsert 和 vlstorage 三种角色。（不合理，未来的版本可能会修改过来）
+
+
+
+### vlinsert
+
+* 可以启动 tcp 或者 udp 的服务
+
+* Tcp 服务
+  * 每个 socket 连接 go 出一个协程来处理
+  * 如果是压缩的块，先解压
+  * 逐行解析日志
+  * 调用接口 `LogMessageProcessor` 的 `AddRow` 方法
+* 通过 stream 的 hash 值来决定把日志数据丢到哪个节点
+
+```go
+// app/vlstorage/netinsert/netinsert.go
+// AddRow adds the given log row into s.
+func (s *Storage) AddRow(streamHash uint64, r *logstorage.InsertRow) {
+	idx := s.srt.getNodeIdx(streamHash)  // 通过 stream hash 值来决定丢到哪个后端节点
+	sn := s.sns[idx]
+	sn.addRow(r)
+}
+```
+
+注意：目前(2025-07)还是比较早期的版本，没有使用更加稳妥的一致性hash等算法。
+
+* 积累 2mb 的日志数据
+* 进行 zstd 压缩
+* 通过 http post把数据发到 vlstorage 节点的 `/internal/insert` 这个路径上去
+* 2xx 状态码表示成功
+
+
+
 ## todo
 
 * 数据的 merge 流程
