@@ -1,8 +1,39 @@
 
 # 5.vm-storage基础结构
 
+## 5.1 索引结构
 
-## 5.1 磁盘目录结构
+一句话总结索引的结构如下：
+
+* 整个索引可以看成一个排好序的巨大的 string 类型的数组
+  * 把这个巨大的 string 数组分成如下的层级，分而治之：
+    * 表：分为 prev 和 curr 两个表，分别存储两个 retention(存储时间期限) 的数据
+    * part: 每个 part 会存储到一个独立的 part 文件夹
+    * Block 组：包含多个 block
+    * Block: 包含多个 item
+    * Item: 这个巨大的 string 数组中的一条 string
+*  每条索引字符串的第一个字节用 0-7 的一个数值来代表索引的类型：
+  * 索引0：metricName -> tsid
+  * 索引1：tag -> metric ID
+  * 索引2：metric ID -> tsid
+  * 索引3：metricID -> metricName
+  * 索引4：deleted metric ID 1, deleted metric ID 2....
+  * 索引5：date -> metric ID list (可以根据此索引知道：某一天有没有数据)
+  * 索引6：date + tag -> metric ID list (可以根据此索引知道：某一天的某个 tag 有没有数据)
+  * 索引7：date + metricName -> tsid list
+
+* 每条索引的第二到第九字节，用于存储 tenant ID，这样就可以从逻辑上把不同的租户的数据隔离开
+
+* 因为整个索引是个巨大的排好序的字符串数组，所以从索引中查询数据的方式就是前缀匹配的二分查找
+  * 先查询 curr table，找不到再查询 prev table
+  * 通过 part header 的 first item 来在多个 part 之间做二分查找，定位到数据所在的 part
+  * 通过 block header 的 first item 来在多个 block 之间做二分查找，定位到数据所在的 block
+  * 如果block数据不在内存，会把 block 加载到内存，形成一个 inMemoryPart
+  * inMemoryPart 可以认为是一个完整的排好序的字符串数组，可以在 inMemoryPart 内通过前缀匹配 + 二分查找来找到记录
+
+* 通过索引找到每条 metric 对应的 metric ID 后，再都数据区域去查询对应的 metrics 的 data point 数据。
+
+## 5.2 磁盘目录结构
 
 这篇文章对目录结构有很好的介绍: [大铁憨(胡建洪):浅析下开源时序数据库VictoriaMetrics的存储机制](https://zhuanlan.zhihu.com/p/368912946)
 
@@ -25,7 +56,7 @@
 
 
 
-### 5.1.1 indexdb目录
+### 5.2.1 indexdb目录
 
 * indexdb包含每个索引分区的文件夹
   * 以 time.Now().UnixNano() 值为起点，递增后，转换为十六进制字符串，以此作为文件夹的名称
@@ -52,7 +83,7 @@
   * items.bin: 包含多个block
   * lens.bin: 包含每个block中每个item的长度信息
 
-### 5.1.2 data目录
+### 5.2.2 data目录
 
 data目录包含big/small两个目录。这两个目录在这一级不太合理，其实是为了区分part的big和small。
 
@@ -78,17 +109,17 @@ big/small目录下面是partition目录。
 
 
 
-## 5.2 文件结构
+## 5.3 文件结构
 
 文件都只在part目录下。
 
-### 5.2.1 索引part
+### 5.3.1 索引part
 
 此处引用胡建洪画的图：
 
 ![](../assets/img/5/hujianhong_indexdb_format.jpg)
 
-#### 5.2.1.1 metadata.json文件
+#### 5.3.1.1 metadata.json文件
 
 metadata.json描述整个part的汇总信息，解析后对应这这个结构：
 
@@ -112,7 +143,7 @@ type partHeader struct {
 }
 ```
 
-#### 5.2.1.2 metaindex.bin文件
+#### 5.3.1.2 metaindex.bin文件
 
 metaindex.bin存储所有blockIndex的信息。
 
@@ -142,7 +173,7 @@ type metaindexRow struct {
 
 
 
-#### 5.2.1.3 index.bin文件
+#### 5.3.1.3 index.bin文件
 
 index.bin包含所有block的信息。
 
@@ -184,7 +215,7 @@ type blockHeader struct {
 
 
 
-#### 5.2.1.4 items.bin与lens.bin
+#### 5.3.1.4 items.bin与lens.bin
 
 * 通过blockHeader中lensBlockOffset和lensBlockSize两个字段，索引到lens.bin中的内容
   * 先做ZSTD解压缩
@@ -205,13 +236,13 @@ type blockHeader struct {
 
 
 
-### 5.2.2 数据part
+### 5.3.2 数据part
 
 此处引用胡建洪画的图：
 
 ![](../assets/img/5/hujianhong_data_format.jpg)
 
-#### 5.2.2.1 metadata.bin文件
+#### 5.3.2.1 metadata.bin文件
 
 与indexdb类似，metadata.bin存储所有indexBlock的元数据信息。
 
@@ -222,7 +253,7 @@ type blockHeader struct {
 
 * 每个metaindexRow对应着index.bin中的indexBlock
 
-#### 5.2.2.2 index.bin
+#### 5.3.2.2 index.bin
 
 * 应用内存映射文件的方式来从index.bin获取数据
 * 通过metaindexRow中的IndexBlockOffset+IndexBlockSize字段确定在index.bin文件中的位置
@@ -235,7 +266,7 @@ type blockHeader struct {
 
 每个block只存储一个TSID的信息。
 
-#### 5.2.2.3 timestamps.bin和values.bin
+#### 5.3.2.3 timestamps.bin和values.bin
 
 这两个文件存储tsid对应的时间戳和value。这两个文件都使用内存映射文件来读取数据。
 
