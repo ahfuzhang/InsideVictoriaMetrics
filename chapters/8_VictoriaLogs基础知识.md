@@ -1,4 +1,4 @@
-# 8.VictoriaLogs 基础知识
+# [WIP]8.VictoriaLogs 基础知识
 
 2023 年 6 月，VM 团队开了一个新的产品线： VictoriaLogs.
 两年过去了，VictoriaLogs 已经非常成熟，并且还推出了群集版本。
@@ -42,6 +42,10 @@ message: very long text
 
 显而易见，在标签部分，tag name + tag value 的格式， 与 metrics 数据的格式是一致的。
 因此，如果用存储 metrics 数据的方式来存储标签部分，那么就可以利用 tsdb 的存储引擎来高效过滤日志。
+
+
+
+* 从用户行为看：日志数据写极多，读极少。因此探寻日志数据的规律，通过消耗更多的 cpu 资源来把日志数据做到尽可能高的压缩率，并且根据查询的需求把数据组织起来是很重要的。
 
 
 
@@ -363,6 +367,7 @@ func (ve *valuesEncoder) encode(values []string, dict *valuesDict) (valueType, u
     * 不缓存，频繁的查询就会每次都搜索索引
     * 缓存了，缓存周期内的产生的数据查询不到
     * 最终，6 分钟左右的时间可能在查询性能和新 streamID 可搜索到这两个事情上，可以取一个平衡
+* 两个 cache 对象都是 storage 对象的成员
 
 ### 8.5.1 streamID cache
 
@@ -398,6 +403,45 @@ func (ve *valuesEncoder) encode(values []string, dict *valuesDict) (valueType, u
   * 每一列的 values，尝试解析数据类型，根据数据类型做转换
   * 每一列的values 中的每个 value，做分词运算，然后把分词结果计算 hashcode，然后写入 bloom filter
   * 数据做 zstd 压缩，写入文件
+
+
+
+### elasticsearch 格式写入
+
+app/vlinsert/elasticsearch/elasticsearch.go
+
+http body:
+
+```json
+{"create":{"_index":"filebeat-8.8.0"}}
+{"@timestamp":"2023-06-06T04:48:11.735Z","log":{"offset":71770,"file":{"path":"/var/log/auth.log"}},"message":"foobar"}
+{"create":{"_index":"filebeat-8.8.0"}}
+{"@timestamp":"2023-06-06 04:48:12.735+01:00","message":"baz"}
+{"index":{"_index":"filebeat-8.8.0"}}
+{"message":"xyz","@timestamp":"1686026893735","x":"y"}
+{"create":{"_index":"filebeat-8.8.0"}}
+{"message":"qwe rty","@timestamp":"1686026893"}
+{"create":{"_index":"filebeat-8.8.0"}}
+{"message":"qwe rty float","@timestamp":"1686026123.62"}
+```
+
+http querystring:
+
+* AccountID
+* ProjectID
+* _time_field
+* _msg_field
+* _stream_fields
+* ignore_fields
+* decolorize_fields
+* extra_fields
+* debug
+
+请求路径：/insert/elasticsearch/_bulk
+
+
+
+
 
 
 
