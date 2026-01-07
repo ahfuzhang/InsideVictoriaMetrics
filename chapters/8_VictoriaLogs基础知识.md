@@ -53,12 +53,14 @@ message: very long text
 
 * 以日志的时间戳来对日志数据分片
   * 每天一个文件夹
+    * 由此：存储更长时间的日志，只会影响磁盘空间，不会影响写入性能、查询性能、索引大小等。
   * 数据的保存周期最少 1 天
   * 超过数据保存天数的旧文件夹会自动删除
     * 从而避免存储空间变满
 * 通过索引和数据两部分来存储日志
   * 日志中的tag name 和 tag value 存储为索引
     * 查询时可以通过过滤 tag 来缩小日志的搜索范围
+    * 更准确地说：只有设定为 stream field 的 tag 才会放入索引
   * 完整的一行日志(时间戳，tags, message)会完整的存储到数据部分
 
 
@@ -83,7 +85,7 @@ message: very long text
   * 假如 tag1 + tag2 + tag3 的日志中，我们把 tag1 + tag2 作为 stream，第一次产生这样的日志时，tag1/tag2/tag3 都会建立索引。
   * 如果后续日志中又出现了新的 tag，例如：tag1 + tag2 + tag3 + tag4这样的组合，因为 tag1 + tag2 不变，就会认为这条日志是已经存在的 stream，因此 tag4 不会被写入索引中。未来如果通过 tag4 过滤，是无法通过索引来加速的，只能到数据部分进行过滤。
   * 因此，tag 的数量如果在日志输出的过程中动态增减，需要考虑到对索引的印象。
-
+  * 一定只有 stream field 中的 tag 才会建立索引
 * 不要把频繁变化的 tag value 放到 stream 中：
   * 例如：user id, client ip 等（除非大多数情况下都要根据这个字段来过滤）
   * 如同 VictoriaMetrics，过多的 time series 会导致创建大量索引。过多的不同 tag 的组合也会导致创建大量索引。
@@ -245,6 +247,10 @@ const (
 
 
 
+<font color=red>查询时：只有选择 stream field 中的字段，才会命中索引</font>
+
+
+
 ## 8.4 数据的格式
 
 ### 8.4.1 block header
@@ -368,11 +374,12 @@ func (ve *valuesEncoder) encode(values []string, dict *valuesDict) (valueType, u
     * 缓存了，缓存周期内的产生的数据查询不到
     * 最终，6 分钟左右的时间可能在查询性能和新 streamID 可搜索到这两个事情上，可以取一个平衡
 * 两个 cache 对象都是 storage 对象的成员
+* cache 处于 storage 对象上，与 partition 无关
 
 ### 8.5.1 streamID cache
 
 * key: 分区名 + streamID
-* value: bool 值，表示存在此 streamID
+* value: bool 值，表示某一天存在此 streamID
 
 ### 8.5.2 filterStreamCache
 
@@ -516,6 +523,41 @@ func (s *Storage) AddRow(streamHash uint64, r *logstorage.InsertRow) {
 * 进行 zstd 压缩
 * 通过 http post把数据发到 vlstorage 节点的 `/internal/insert` 这个路径上去
 * 2xx 状态码表示成功
+
+
+
+## 8.9 关键代码
+
+* 内存 row 中的数据变成 block 对象，再序列化到磁盘
+
+```go
+// lib/logstorage/block_stream_writer.go
+
+
+// MustWriteRows writes timestamps with rows under the given sid to bsw.
+//
+// timestamps must be sorted.
+// sid must be bigger or equal to the sid for the previously written rs.
+// 这里是内存数据变成 block 对象的核心代码
+func (bsw *blockStreamWriter) MustWriteRows(sid *streamID, timestamps []int64, rows [][]Field) {
+	if len(timestamps) == 0 {
+		return
+	}
+
+	b := getBlock()
+	// 就好像刚刚写入很多 row 一样
+	// ??? timestamp 有没有可能没有充分排序
+	b.MustInitFromRows(timestamps, rows)
+	// block 的数据进行序列化，然后写入磁盘
+	// 这里进行列列的类型转换，并且对所有 tag value 进行分词，并写入 bloom filter
+	bsw.MustWriteBlock(sid, b)
+	putBlock(b)
+}
+```
+
+
+
+
 
 
 
