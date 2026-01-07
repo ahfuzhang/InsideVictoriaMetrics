@@ -1,4 +1,4 @@
-# [WIP]8.VictoriaLogs 基础知识
+# 8.VictoriaLogs 基础知识
 
 2023 年 6 月，VM 团队开了一个新的产品线： VictoriaLogs.
 两年过去了，VictoriaLogs 已经非常成熟，并且还推出了群集版本。
