@@ -1,0 +1,57 @@
+name: Deploy GitBook to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 10
+
+      - name: Install GitBook CLI
+        run: |
+          npm install -g gitbook-cli
+
+      - name: Install GitBook plugins
+        run: |
+          gitbook install
+
+      - name: Build GitBook
+        run: |
+          gitbook build . _book
+
+      - name: Disable Jekyll
+        run: |
+          touch _book/.nojekyll
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _book
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
+        
