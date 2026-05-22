@@ -16,3 +16,8 @@ serve:
 #	gitbook epub ./ ./build/Inside-VictoriaMetrics-ahfuzhang.epub
 
 .PHONY: install init serve
+
+build:
+	gitbook install
+	gitbook build . _book
+	

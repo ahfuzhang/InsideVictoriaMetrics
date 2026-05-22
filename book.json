@@ -1,3 +1,14 @@
 {
-  "title": "Inside VictoriaMetrics"
+  "title": "Inside VictoriaMetrics",
+  "description": "深入剖析 VictoriaMetrics 存储引擎原理",
+  "author": "Fuchun Zhang",
+  "language": "zh-hans",
+  "gitbook": "3.x.x",
+  "root": ".",
+  "structure": {
+    "readme": "README.md",
+    "summary": "SUMMARY.md"
+  },
+  "plugins": [],
+  "pluginsConfig": {}
 }
